@@ -39,6 +39,16 @@ pushconvert(a::Vector{T}, b::V) where {T, V} = push!(convert(Vector{promote_type
 ##### Slab
 #####
 
+"""
+Indexing
+--------
+
+* `S[i::Integer] -> NamedTuple`: `i`th row of the StructArray
+* `S[nt::NamedTuple] -> Slab`: Filter for all entries matching `nt`.
+* `S[;kw...] -> Slab`: Syntax shorthand for `S[::NamedTuple]`.
+* `S[s::Symbol] -> Vector`: Return column `s`.
+* `S[t::NTuple{N,Symbol}] -> Vector{<:Tuple}`: Return columns for each entry in `t`.
+"""
 mutable struct Slab
     slab::StructArray
 end
@@ -46,12 +56,16 @@ Slab() = Slab(StructArrays.StructArray())
 
 # Wrap some methods
 Base.length(S::Slab) = length(S.slab)
+Base.iterate(S::Slab) = iterate(S.slab)
+Base.iterate(S::Slab, state) = iterate(S.slab, state)
+Base.eltype(S::Slab) = eltype(S.slab)
+
 Base.getindex(S::Slab, i::Integer) = S.slab[i]
 Base.getindex(S::Slab, i) = Slab(StructArray(S.slab[i]))
 Base.getindex(S::Slab, nt::NamedTuple) = S[findall(x -> ismatch(x, nt), S.slab)]
 Base.getindex(S::Slab; kw...) = S[(;kw...)]
-
-namesof(::Type{<:NamedTuple{names}}) where {names} = names
+Base.getindex(S::Slab, s::Symbol) = getproperty(S.slab, s)
+Base.getindex(S::Slab, s::NTuple{N,Symbol}) where {N} = [getproperty.(Ref(x), s) for x in S]
 
 # Hook for customizing merging.
 datamerge(a, b) = b
@@ -69,10 +83,10 @@ function Base.setindex!(
     @assert !haskey(nt, :data)
 
     # Expand the new entry so it has all the keys in the original database.
-    nt = expand(merge(nt, (data = data,)), namesof(eltype(structarray)))
+    nt = expand(merge(nt, (data = data,)), propertynames(structarray))
 
     # If the names of `nt` are a subset of the keys already in `db` - we may be able to merge.
-    if issubset(keys(nt), namesof(eltype(structarray)))
+    if issubset(keys(nt), propertynames(structarray))
         for row in Tables.rows(structarray)
             if ismatch(row, nt)
                 # Merge the data entries
