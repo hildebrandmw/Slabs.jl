@@ -60,8 +60,10 @@ Base.iterate(S::Slab) = iterate(S.slab)
 Base.iterate(S::Slab, state) = iterate(S.slab, state)
 Base.eltype(S::Slab) = eltype(S.slab)
 
+# ALL of the various getindexing behaviors
 Base.getindex(S::Slab, i::Integer) = S.slab[i]
 Base.getindex(S::Slab, i) = Slab(StructArray(S.slab[i]))
+Base.getindex(S::Slab, ::Nothing) = S
 Base.getindex(S::Slab, nt::NamedTuple) = S[findall(x -> ismatch(x, nt), S.slab)]
 Base.getindex(S::Slab; kw...) = S[(;kw...)]
 Base.getindex(S::Slab, s::Symbol) = getproperty(S.slab, s)
@@ -71,9 +73,9 @@ Base.getindex(S::Slab, s::NTuple{N,Symbol}) where {N} = [getproperty.(Ref(x), s)
 datamerge(a, b) = b
 
 function Base.setindex!(
-        slab::Slab, 
+        slab::Slab,
         dict::Dict{Symbol},
-        @nospecialize(nt::NamedTuple), 
+        @nospecialize(nt::NamedTuple),
     )
 
     structarray = slab.slab
@@ -87,12 +89,21 @@ function Base.setindex!(
 
     # If the names of `nt` are a subset of the keys already in `db` - we may be able to merge.
     if issubset(keys(nt), propertynames(structarray))
+        local savedrow
+        found = false
         for row in Tables.rows(structarray)
             if ismatch(row, nt)
-                # Merge the data entries
-                merge!(datamerge, row.data, nt.data)
-                return db
+                found == true && error("Found Multiple Matches for $nt")
+
+                savedrow = row
+                found = true
             end
+        end
+
+        if found
+            # Merge the data entries
+            merge!(datamerge, savedrow.data, nt.data)
+            return slab
         end
     end
 
@@ -130,9 +141,9 @@ function Base.show(io::IO, slab::Slab)
 
     vectors = (getproperty(slab.slab, i) for i in header)
     pretty_table(
-        io, 
-        hcat(vectors...), 
-        header; 
+        io,
+        hcat(vectors...),
+        header;
         # Let this thing get tall.
         crop = :horizontal,
     )
