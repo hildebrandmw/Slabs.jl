@@ -1,152 +1,120 @@
 module Slabs
 
-export Slab
-
-using PrettyTables
-using StructArrays
+using DataStructures
 using Tables
+using PrettyTables
 
-#####
-##### Utilities
-#####
+# A row in the table
+struct Entry <: Tables.AbstractRow
+    parameters::SortedDict{Symbol,Any}
+    data::Dict{String,Any}
+end
+parameters(x::Entry) = getfield(x, :parameters)
+Base.:(==)(x::Entry, y::Entry) = parameters(x) == parameters(y)
 
-# Sort NamedTuples alphabetically
-ntsort(x::NamedTuple) = (;sort([pairs(x)...]; by = x -> first(x))...)
-
-function ismatch(a::NamedTuple, b::NamedTuple)
-    # Can only match if `b` is possibly a subset of `a`.
-    issubset(keys(b), keys(a)) || return false
-    for (k, v) in pairs(b)
-        # The "data" field is special - don't compare here for equality
-        k == :data && continue
-        a[k] == v || return false
+struct Sentinel end
+function Base.:(==)(x::SortedDict{Symbol,Any}, y::Entry)
+    params = parameters(y)
+    for (k,v) in x
+        val = get(params, k, Sentinel())
+        val == v || return false
     end
     return true
 end
+Base.keys(x::Entry) = keys(parameters(x))
 
-# Add in `nothing` entries
-function expand(@nospecialize(nt::NamedTuple), names; f = () -> nothing)
-    newnames = Tuple(setdiff(names, keys(nt)))
-    nothing_tuple = NamedTuple{newnames}(ntuple(i -> f(), length(newnames)))
-    expanded_nt = merge(nt, nothing_tuple)
-    return ntsort(expanded_nt)
+Base.getindex(x::Entry) = getfield(x, :data)
+Base.getindex(x::Entry, nm::Symbol) = parameters(x)[nm]
+
+# Table API
+Tables.getcolumn(x::Entry, nm::Symbol) = x[nm]
+Tables.getcolumn(x::Entry, i::Integer) = Tables.getcolumn(x, collect(keys(x))[i])
+Tables.columnnames(x::Entry) = collect(keys(x))
+
+# Adding empty fields to an Entry
+function expand!(d::SortedDict{Symbol,Any}, ks)
+    for k in ks
+        get!(d, k, nothing)
+    end
+    return nothing
 end
-
-# Type expanding version push!
-pushconvert(a::Vector{T}, b::V) where {T, V} = push!(convert(Vector{promote_type(T,V)}, a), b)
+expand!(E::Entry, ks) = expand!(parameters(E), ks)
 
 #####
 ##### Slab
 #####
-
-"""
-Indexing
---------
-
-* `S[i::Integer] -> NamedTuple`: `i`th row of the StructArray
-* `S[nt::NamedTuple] -> Slab`: Filter for all entries matching `nt`.
-* `S[;kw...] -> Slab`: Syntax shorthand for `S[::NamedTuple]`.
-* `S[s::Symbol] -> Vector`: Return column `s`.
-* `S[t::NTuple{N,Symbol}] -> Vector{<:Tuple}`: Return columns for each entry in `t`.
-"""
-mutable struct Slab
-    slab::StructArray
+struct Slab
+    entries::Vector{Entry}
+    keys::Vector{Symbol}
 end
-Slab() = Slab(StructArrays.StructArray())
+Base.keys(slab::Slab) = slab.keys
 
-# Wrap some methods
-Base.length(S::Slab) = length(S.slab)
-Base.iterate(S::Slab) = iterate(S.slab)
-Base.iterate(S::Slab, state) = iterate(S.slab, state)
-Base.eltype(S::Slab) = eltype(S.slab)
+Tables.istable(::Type{Slab}) = true
+Tables.rowaccess(::Type{Slab}) = true
+Tables.rows(slab::Slab) = slab.entries
 
-# ALL of the various getindexing behaviors
-Base.getindex(S::Slab, i::Integer) = S.slab[i]
-Base.getindex(S::Slab, i) = Slab(StructArray(S.slab[i]))
-Base.getindex(S::Slab, ::Nothing) = S
-Base.getindex(S::Slab, nt::NamedTuple) = S[findall(x -> ismatch(x, nt), S.slab)]
-Base.getindex(S::Slab; kw...) = S[(;kw...)]
-Base.getindex(S::Slab, s::Symbol) = getproperty(S.slab, s)
-Base.getindex(S::Slab, s::NTuple{N,Symbol}) where {N} = [getproperty.(Ref(x), s) for x in S]
+Slab() = Slab(Entry[], Symbol[])
 
-# Hook for customizing merging.
 datamerge(a, b) = b
+function Base.setindex!(slab::Slab, data::Dict{String}, parameters::Dict{Symbol})
+    parameters = SortedDict{Symbol,Any}(parameters)
+    data = Dict{String,Any}(data)
 
-function Base.setindex!(
-        slab::Slab,
-        dict::Dict{Symbol},
-        @nospecialize(nt::NamedTuple),
-    )
+    # Add in all of the keys from the slab.
+    expand!(parameters, keys(slab))
+    entry = Entry(parameters, data)
 
-    structarray = slab.slab
-    data = Dict{Symbol,Any}(dict)
-
-    # This field is reserved. Keep myself from being an idiot.
-    @assert !haskey(nt, :data)
-
-    # Expand the new entry so it has all the keys in the original database.
-    nt = expand(merge(nt, (data = data,)), propertynames(structarray))
-
-    # If the names of `nt` are a subset of the keys already in `db` - we may be able to merge.
-    if issubset(keys(nt), propertynames(structarray))
-        local savedrow
-        found = false
-        for row in Tables.rows(structarray)
-            if ismatch(row, nt)
-                found == true && error("Found Multiple Matches for $nt")
-
-                savedrow = row
-                found = true
-            end
+    # If the keys of this new entry are a subset of the keys already existing in the slab,
+    # then we have to check if this entry already exists in the Slab.
+    if issubset(keys(parameters), keys(slab))
+        i = findfirst(isequal(entry), Tables.rows(slab))
+        if !isnothing(i)
+            merge!(datamerge, slab[i].data, data)
+            return nothing
         end
-
-        if found
-            # Merge the data entries
-            merge!(datamerge, savedrow.data, nt.data)
-            return slab
-        end
+    else
+        # Expand the existing entries for any new keys that were potentially created.
+        expand!.(Tables.rows(slab), Ref(keys(entry)))
+        append!(keys(slab), setdiff(keys(entry), keys(slab)))
+        sort!(keys(slab))
     end
 
-    # If the slab is empty, just wrap up the current entry
-    if iszero(length(structarray))
-        slab.slab = StructArray([nt])
-        return slab
-    end
-
-    # Otherwise, we have to do a bunch of promotion on everything.
-    arrays = expand(
-        StructArrays.fieldarrays(structarray),
-        keys(nt);
-        f = () -> fill(nothing, length(structarray))
-    )
-
-    # Make sure the directions here are still equal.
-    @assert keys(arrays) == keys(nt)
-    conversions = pushconvert.(Tuple(arrays), Tuple(nt))
-
-    # Update the wrapped array and return.
-    arrays = NamedTuple{keys(arrays)}(conversions)
-    slab.slab = StructArray(arrays)
-    return slab
+    # Now we add a new row.
+    push!(slab.entries, entry)
+    return nothing
 end
 
+# Indexing methods for searching and reducing the size of the table.
+Base.length(x::Slab) = length(x.entries)
+Base.iterate(x::Slab) = iterate(x.entries)
+Base.iterate(x::Slab, s) = iterate(x.entries, s)
+Base.eltype(x::Slab) = eltyps(x.entries)
+
+# `getindex` Overloading
+_todict(x::NamedTuple) = SortedDict{Symbol,Any}(k => v for (k,v) in pairs(x))
+Base.getindex(x::Slab, i::Integer) = x.entries[i]
+Base.getindex(x::Slab, i) = Slab(x.entries[i], x.keys)
+Base.getindex(x::Slab, ::Nothing) = Slab()
+function Base.getindex(x::Slab, i::SortedDict{Symbol,Any})
+    return x[findall(x -> isequal(i, x), x.entries)]
+end
+Base.getindex(x::Slab, i::NamedTuple) = x[_todict(i)]
+Base.getindex(x::Slab; kw...) = x[(;kw...,)]
+Base.getindex(x::Slab, s::Symbol) = [ e[s] for e in x ]
+
+Base.in(d::Dict, s::Slab) = any(x -> isequal(SortedDict{Symbol,Any}(d), x), s.entries)
+
+#####
+##### Tables Interface
+#####
+
+# Pretty Printing
 function Base.show(io::IO, slab::Slab)
-    if iszero(length(slab))
-        print(io, "Empty Slab")
-        return nothing
+    if length(slab) == 0
+        println("Empty Slab")
+    else
+        PrettyTables.pretty_table(io, slab, keys(slab))
     end
-
-    sch = Tables.schema(slab.slab)
-    header = filter(!isequal(:data), collect(sch.names))
-
-    vectors = (getproperty(slab.slab, i) for i in header)
-    pretty_table(
-        io,
-        hcat(vectors...),
-        header;
-        # Let this thing get tall.
-        crop = :horizontal,
-    )
 end
 
 end # module
